@@ -344,22 +344,23 @@ class SASF_Module(nn.Module):
 
     def __init__(self, dim, r=8):
         super(SASF_Module, self).__init__()
-        # 共享的可学习跨域状态转移矩阵 A_shared
         self.A_shared = nn.Parameter(torch.randn(dim, dim) / math.sqrt(dim))
 
-        # 门控调制网络 (使用 PEFT)
         self.gate = nn.Sequential(
             LoRALinear(dim * 2, dim, r=r),
             nn.Sigmoid()
         )
 
     def forward(self, h_target, h_source):
-        # 目标域隐状态基于源域隐状态语义线索进行动态校准
-        gate_val = self.gate(torch.cat([h_target, h_source], dim=-1))
-        # 状态流形转移
-        transferred_state = h_source @ self.A_shared.T
-        # 融合与更新
-        h_target_fused = gate_val * h_target + transferred_state
+        # 提取源域全局语义上下文，解决像素维度不对齐的死锁
+        global_source = h_source.mean(dim=1, keepdim=True)
+        global_source_expand = global_source.expand(-1, h_target.size(1), -1)
+
+        # 门控调节与凸组合 (Convex Combination) 防止特征数值爆炸
+        gate_val = self.gate(torch.cat([h_target, global_source_expand], dim=-1))
+        transferred_state = global_source_expand @ self.A_shared.T
+
+        h_target_fused = gate_val * h_target + (1.0 - gate_val) * transferred_state
         return h_target_fused
 
 
