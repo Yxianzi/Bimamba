@@ -141,12 +141,14 @@ for iDataSet in range(nDataSet):
         LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         print('learning rate{: .4f}'.format(LEARNING_RATE))
         optimizer = torch.optim.SGD([
-            {'params': feature_encoder.feature_layers.parameters(),},
+            {'params': feature_encoder.feature_layers.parameters(), },
             {'params': feature_encoder.fc1.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.fc2.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.head1.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},
-        ], lr=LEARNING_RATE , momentum=momentum, weight_decay=l2_decay)
+            # 【致命错误修复 4】：必须将因果模块注册进优化器！
+            {'params': feature_encoder.causal_disentangle.parameters(), 'lr': LEARNING_RATE},
+        ], lr=LEARNING_RATE, momentum=momentum, weight_decay=l2_decay)
 
         feature_encoder.train()
 
