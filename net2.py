@@ -34,8 +34,13 @@ class DSANSS(nn.Module):
         )
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x, y):
-        features_x, features_y = self.feature_layers(x, y)
+    def forward(self, x, y, pretrain=False):
+        # 接收额外的未池化特征图
+        features_x, features_y, F_x_map, F_y_map = self.feature_layers(x, y)
+
+        # 若处于 MAE 预训练模式，直接截断并返回底层特征图，跳过后续的分类头与因果解耦模块
+        if pretrain:
+            return F_x_map, F_y_map
 
         # 应用因果屏蔽：隔离虚假相关性，提取纯粹的因果特征
         causal_feat_x, indep_loss_x = self.causal_disentangle(features_x)
@@ -293,17 +298,18 @@ class DCRN_02(nn.Module):
         y = ca_y * y
         y = sa_y * y
 
-        # 在池化降维前，输入全分辨率三维特征块到 CD-BiMamba 提取全局上下文
+        # 通过 CD-BiMamba 提取全局上下文与域交互
         F_x_map, F_y_map = self.cd_bimamba(x, y)
 
-        # 域自适应特征交互完成后，执行池化满足后续全连接层的降维需求
+        # 交互完成后执行池化
         F_y2x = self.avgpool(F_x_map)
-        F_y2x = F_y2x.view(F_y2x.shape[0], -1)  # 对应源特征输出表示
+        F_y2x = F_y2x.view(F_y2x.shape[0], -1)
 
         F_x2y = self.avgpool(F_y_map)
-        F_x2y = F_x2y.view(F_x2y.shape[0], -1)  # 对应目标特征输出表示
+        F_x2y = F_x2y.view(F_x2y.shape[0], -1)
 
-        return F_y2x, F_x2y
+        # 【追加返回全分辨率的特征图，专供 MAE 重建使用】
+        return F_y2x, F_x2y, F_x_map, F_y_map
 
 
 class LoRALinear(nn.Module):
@@ -608,4 +614,52 @@ class CausalDisentanglement(nn.Module):
         total_causal_loss = indep_loss + 0.1 * sparsity_loss
 
         return f_causal, total_causal_loss
+
+
+class DS_MAE(nn.Module):
+    """
+    双流掩码自编码器 (Dual-Stream Masked Autoencoder, DS-MAE)
+    基于高比例空间与光谱联合掩蔽的无监督预训练模块
+    """
+
+    def __init__(self, encoder, in_channels, embed_dim=288, mask_ratio=0.75):
+        super(DS_MAE, self).__init__()
+        self.encoder = encoder
+        self.mask_ratio = mask_ratio
+
+        # 独立的浅层重建解码器 (旨在将特征流形逆映射回原始波段与空间尺寸)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(embed_dim, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
+            nn.Conv2d(256, in_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x, y):
+        B, C, H, W = x.shape
+
+        # 1. 高比例随机联合掩蔽 (生成 0/1 掩码矩阵，1代表被保留，0代表被掩蔽破坏)
+        # 掩蔽破坏了连续的空间邻域与光谱吸收峰，强制 Mamba 进行深层序列联想
+        mask_x = (torch.rand(B, C, H, W, device=x.device) > self.mask_ratio).float()
+        mask_y = (torch.rand(B, C, H, W, device=y.device) > self.mask_ratio).float()
+
+        masked_x = x * mask_x
+        masked_y = y * mask_y
+
+        # 2. 调用主干网络的预训练模式提取特征
+        f_x_map, f_y_map = self.encoder(masked_x, masked_y, pretrain=True)
+
+        # 3. 解码器基于残余信息进行全像素重建
+        rec_x = self.decoder(f_x_map)
+        rec_y = self.decoder(f_y_map)
+
+        # 4. 仅针对“被破坏(掩蔽)”的像素计算重建损失 (MSE)
+        loss_x = F.mse_loss(rec_x, x, reduction='none')
+        loss_y = F.mse_loss(rec_y, y, reduction='none')
+
+        # 归一化重构误差
+        loss_x = (loss_x * (1 - mask_x)).sum() / ((1 - mask_x).sum() + 1e-8)
+        loss_y = (loss_y * (1 - mask_y)).sum() / ((1 - mask_y).sum() + 1e-8)
+
+        return loss_x + loss_y
 

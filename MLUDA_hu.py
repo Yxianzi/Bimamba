@@ -12,7 +12,7 @@ from torch.autograd import Variable
 import mmd
 import numpy as np
 from sklearn import metrics
-from net2 import DSANSS
+from net2 import DSANSS, DS_MAE
 import time
 import utils
 from torch.utils.data import TensorDataset, DataLoader
@@ -66,7 +66,58 @@ for iDataSet in range(nDataSet):
     # model
     feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()
 
-    print("Training...")
+    # =========================================================================
+    # 第一阶段：DS-MAE 无监督预训练 (Unsupervised Pre-training Phase)
+    # 目标：通过掩蔽重建任务，使网络在无标签状态下内化地物的物理光谱成键规律
+    # =========================================================================
+    print("=========================================")
+    print("Phase 1: Starting DS-MAE Unsupervised Pre-training...")
+    # 实例化 MAE，in_channels 接收 Houston 降维后的 nBand
+    mae_model = DS_MAE(encoder=feature_encoder, in_channels=nBand, embed_dim=288, mask_ratio=0.75).cuda()
+    mae_optimizer = torch.optim.Adam(mae_model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+    pretrain_epochs = 20  # 预训练轮次，可根据数据集大小灵活调整 (10~30轮)
+    num_iter = len_source_loader  # 提前定义全局迭代次数，消除作用域未定义错误
+
+    for p_epoch in range(pretrain_epochs):
+        mae_model.train()
+        total_mae_loss = 0.0
+
+        # 修正：使用正确的数据加载器名称 train_loader_s 与 train_loader_t
+        source_train_iter_mae = iter(train_loader_s)
+        target_train_iter_mae = iter(train_loader_t)
+
+        for i in range(1, num_iter):
+            # 获取源域数据
+            try:
+                source_data, _ = next(source_train_iter_mae)
+            except StopIteration:
+                source_train_iter_mae = iter(train_loader_s)
+                source_data, _ = next(source_train_iter_mae)
+
+            # 获取目标域数据
+            try:
+                target_data, _ = next(target_train_iter_mae)
+            except StopIteration:
+                target_train_iter_mae = iter(train_loader_t)
+                target_data, _ = next(target_train_iter_mae)
+
+            mae_optimizer.zero_grad()
+            # 执行高比例空间与光谱联合掩蔽及重建
+            loss_mae = mae_model(source_data.cuda(), target_data.cuda())
+            loss_mae.backward()
+            mae_optimizer.step()
+            total_mae_loss += loss_mae.item()
+
+        print('DS-MAE Pre-train Epoch {:>3d}:   MSE Loss: {:6.4f}'.format(p_epoch + 1, total_mae_loss / num_iter))
+
+    print("Phase 1 Completed: Feature Extractor initialized with deep physical semantics.")
+    print("=========================================\n")
+
+    # =========================================================================
+    # 第二阶段：主 UDA 微调流水线 (Main UDA Fine-tuning Pipeline)
+    # =========================================================================
+    print("Phase 2: Training UDA Pipeline...")
 
     last_accuracy = 0.0
     best_episdoe = 0
